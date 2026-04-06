@@ -5,7 +5,7 @@ FILE_HELPER_NAME = "文件传输助手"
 APP_WINDOW_TITLE = "校园集市APP"
 
 LINK_PREFIX = "mp://"
-SAVE_KEYWORD = "en1"
+SAVE_KEYWORD = ""
 RESULT_DIR = "result"
 
 WAIT_AFTER_FOCUS = 0.1
