@@ -14,10 +14,13 @@ from config import (
     WAIT_APP_POPUP,
     WAIT_AFTER_APP_FOCUS,
     WAIT_AFTER_CLOSE_APP,
+    INITIAL_CAPTURE_BURST_COUNT,
+    INITIAL_CAPTURE_BURST_INTERVAL,
     APP_CAPTURE_ROUNDS,
     APP_WINDOW_FIND_RETRIES,
     APP_WINDOW_FIND_INTERVAL,
     SKIP_TEXT_KEYWORDS,
+    BLOCK_TEXT_KEYWORDS,
     POSTS_FILE,
 )
 
@@ -156,6 +159,31 @@ def collect_market_app_text(app_window, rounds=1, click_before_capture=False):
     return merged
 
 
+def collect_transient_text(app_window, burst_count=5, burst_interval=0.08):
+    """窗口弹出后立即连拍，尽量抓住被覆盖前的一瞬间文本"""
+    merged = []
+    seen = set()
+    count = max(1, int(burst_count))
+    interval = max(0.01, float(burst_interval))
+
+    for i in range(count):
+        texts = collect_all_text(app_window)
+        for t in texts:
+            text = t.strip()
+            if not text:
+                continue
+            if text in ["", "0", "1", "2", "3"]:
+                continue
+            if text not in seen:
+                seen.add(text)
+                merged.append(text)
+
+        if i < count - 1:
+            time.sleep(interval)
+
+    return merged
+
+
 def find_and_click_link(ctrl, link_text, max_depth=20):
     """在右侧聊天区中搜索包含指定链接文本的控件并点击，避免误点会话列表"""
     link_id = link_text.replace("mp://", "")
@@ -227,6 +255,28 @@ def write_resume_index(counter_path, idx):
         f.write(str(idx))
 
 
+def save_post_result(result_dir, idx, title, link, status, texts=None, reason=""):
+    """无论命中与否都保存抓取结果，便于后续排查"""
+    filename = f"帖子_{idx:02d}_{safe_filename(title)}.txt"
+    filepath = os.path.join(result_dir, filename)
+    rows = texts or []
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"=== {title} ===\n")
+        f.write(f"链接: {link}\n")
+        f.write(f"状态: {status}\n")
+        if reason:
+            f.write(f"说明: {reason}\n")
+        f.write(f"抓取时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 50 + "\n\n")
+
+        if rows:
+            for i, t in enumerate(rows, 1):
+                f.write(f"{i}. {t}\n")
+        else:
+            f.write("(无可用文本)\n")
+
+
 posts = load_posts(POSTS_FILE)
 if not posts:
     print(f"✗ 帖子列表为空，请检查 {POSTS_FILE}")
@@ -260,9 +310,15 @@ start_idx = read_resume_index(counter_file, len(posts))
 for idx, (title, link) in enumerate(posts[start_idx - 1:], start_idx):
     write_resume_index(counter_file, idx)
     hit = False
+    status = "未命中"
+    reason = ""
+    filtered = []
 
     # 只处理以 mp:// 开头的链接
     if not isinstance(link, str) or not link.startswith(LINK_PREFIX):
+        status = "未命中"
+        reason = "链接格式无效（非 mp://）"
+        save_post_result(result_dir, idx, title, link, status, filtered, reason)
         print(f"[{idx}/{len(posts)}] 未命中")
         continue
 
@@ -297,7 +353,8 @@ for idx, (title, link) in enumerate(posts[start_idx - 1:], start_idx):
             msg_y = rect.bottom - 180
             auto.Click(msg_x, msg_y)
 
-        time.sleep(WAIT_APP_POPUP)  # 等待小程序窗口弹出
+        # 不做长等待，尽快开始找窗口并抓取瞬时文本
+        time.sleep(min(WAIT_APP_POPUP, 0.08))
 
         # ====== 抓取“校园集市APP”窗口内容 ======
         app_window = find_window_by_exact_title(
@@ -306,13 +363,29 @@ for idx, (title, link) in enumerate(posts[start_idx - 1:], start_idx):
             interval=APP_WINDOW_FIND_INTERVAL,
         )
         if not app_window:
+            status = "未命中"
+            reason = f"未找到窗口：{APP_WINDOW_TITLE}"
+            save_post_result(result_dir, idx, title, link, status, filtered, reason)
             print(f"[{idx}/{len(posts)}] 未命中")
             continue
+
+        # 先连拍短暂内容，再做常规抓取，避免被验证页覆盖后丢失正文
+        burst_texts = collect_transient_text(
+            app_window,
+            burst_count=INITIAL_CAPTURE_BURST_COUNT,
+            burst_interval=INITIAL_CAPTURE_BURST_INTERVAL,
+        )
 
         app_window.SetFocus()
         time.sleep(WAIT_AFTER_APP_FOCUS)
 
-        all_texts = collect_market_app_text(app_window, rounds=APP_CAPTURE_ROUNDS)
+        normal_texts = collect_market_app_text(app_window, rounds=APP_CAPTURE_ROUNDS)
+        all_texts = []
+        seen_all = set()
+        for t in burst_texts + normal_texts:
+            if t not in seen_all:
+                seen_all.add(t)
+                all_texts.append(t)
 
         # 过滤掉明显非正文控件词
         skip_keywords = SKIP_TEXT_KEYWORDS
@@ -323,19 +396,23 @@ for idx, (title, link) in enumerate(posts[start_idx - 1:], start_idx):
 
         keyword = SAVE_KEYWORD
         content_text = "\n".join(filtered)
+        blocked = any(k in content_text for k in BLOCK_TEXT_KEYWORDS)
         if keyword in content_text:
-            filename = f"帖子_{idx:02d}_{safe_filename(title)}.txt"
-            filepath = os.path.join(result_dir, filename)
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(f"=== {title} ===\n")
-                f.write(f"链接: {link}\n")
-                f.write(f"抓取时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 50 + "\n\n")
-                for i, t in enumerate(filtered, 1):
-                    f.write(f"{i}. {t}\n")
-
             hit = True
+            status = "命中"
+            if blocked:
+                reason = f"包含关键词：{keyword}；后续出现频控/验证页面"
+            else:
+                reason = f"包含关键词：{keyword}"
             success_count += 1
+        else:
+            status = "未命中"
+            if blocked and filtered:
+                reason = f"出现频控/验证页面；已保留瞬时抓取文本，但未包含关键词：{keyword}"
+            elif blocked:
+                reason = "出现频控/验证页面，且未抓到有效正文"
+            else:
+                reason = f"未包含关键词：{keyword}"
 
         # 返回聊天界面（关闭小程序）
         app_window.SetFocus()
@@ -345,8 +422,11 @@ for idx, (title, link) in enumerate(posts[start_idx - 1:], start_idx):
         wechat_window.SetFocus()
         time.sleep(0.12)
 
-    except Exception:
+    except Exception as e:
+        status = "异常"
+        reason = str(e)[:300]
         time.sleep(0.2)
 
+    save_post_result(result_dir, idx, title, link, status, filtered, reason)
     print(f"[{idx}/{len(posts)}] {'命中' if hit else '未命中'}")
 
