@@ -93,6 +93,7 @@ def load_posts(file_path):
         posts.append((title, link))
         prev_end = m.end()
 
+    # 按文本原始顺序处理：从第一条到最后一条
     return posts
 
 
@@ -111,19 +112,21 @@ def find_window_by_exact_title(title, retries=10, interval=0.6):
     return None
 
 
-def collect_market_app_text(app_window, rounds=1):
+def collect_market_app_text(app_window, rounds=1, click_before_capture=False):
     """从“校园集市APP”窗口抓取可见文本，并翻页收集更多内容"""
     merged = []
     seen = set()
 
     for i in range(rounds):
-        try:
-            rect = app_window.BoundingRectangle
-            center_x = (rect.left + rect.right) // 2
-            center_y = (rect.top + rect.bottom) // 2
-            auto.Click(center_x, center_y)
-        except:
-            pass
+        # 默认不进行二次点击，避免进入链接后再次触发页面交互。
+        if click_before_capture:
+            try:
+                rect = app_window.BoundingRectangle
+                center_x = (rect.left + rect.right) // 2
+                center_y = (rect.top + rect.bottom) // 2
+                auto.Click(center_x, center_y)
+            except:
+                pass
 
         texts = collect_all_text(app_window)
         added = 0
@@ -138,8 +141,6 @@ def collect_market_app_text(app_window, rounds=1):
                 seen.add(text)
                 merged.append(text)
                 added += 1
-
-        print(f"  抓取轮次 {i + 1}/{rounds}，新增 {added} 条")
 
         # 最后一轮不滚动
         if i < rounds - 1:
@@ -200,8 +201,30 @@ def find_and_click_link(ctrl, link_text, max_depth=20):
     candidates.sort(key=lambda x: x[0], reverse=True)
     _, target_ctrl, target_name = candidates[0]
     target_ctrl.Click()
-    print(f"  ✓ 找到并点击了链接控件: {target_name[:50]}")
     return True
+
+
+def read_resume_index(counter_path, total_posts):
+    """读取断点序号，返回 1-based 起始下标"""
+    if not os.path.exists(counter_path):
+        return 1
+    try:
+        with open(counter_path, 'r', encoding='utf-8') as f:
+            text = f.read().strip()
+        idx = int(text)
+        if idx < 1:
+            return 1
+        if idx > total_posts:
+            return total_posts
+        return idx
+    except:
+        return 1
+
+
+def write_resume_index(counter_path, idx):
+    """写入当前处理到的帖子序号（1-based）"""
+    with open(counter_path, 'w', encoding='utf-8') as f:
+        f.write(str(idx))
 
 
 posts = load_posts(POSTS_FILE)
@@ -210,7 +233,6 @@ if not posts:
     exit(1)
 
 # ========== 找到微信窗口 ==========
-print("搜索微信窗口...")
 root = auto.GetRootControl()
 wechat_window = None
 
@@ -219,7 +241,6 @@ for child in root.GetChildren():
         name = child.Name
         if name and any(kw in name for kw in WECHAT_WINDOW_KEYWORDS):
             wechat_window = child
-            print(f"✓ 找到微信: {name}\n")
             break
     except:
         pass
@@ -228,37 +249,21 @@ if not wechat_window:
     print("✗ 未找到微信窗口，请先打开微信")
     exit(1)
 
-# ========== 先切换到「文件传输助手」避免在群里发消息 ==========
-print("切换到文件传输助手...")
-wechat_window.SetFocus()
-time.sleep(WAIT_AFTER_FOCUS)
-
-# 使用 Ctrl+F 搜索文件传输助手
-auto.SendKeys('{Ctrl}f')
-time.sleep(0.35)
-auto.SetClipboardText(FILE_HELPER_NAME)
-time.sleep(0.08)
-auto.SendKeys('{Ctrl}v')
-time.sleep(0.45)
-auto.SendKeys('{Return}')
-time.sleep(0.45)
-auto.SendKeys('{Escape}')
-time.sleep(0.2)
-
 # ========== 处理每个帖子链接 ==========
-print(f"开始处理 {len(posts)} 个帖子...\n")
 success_count = 0
 
 result_dir = RESULT_DIR
 os.makedirs(result_dir, exist_ok=True)
+counter_file = os.path.join(result_dir, 'ocount.txt')
+start_idx = read_resume_index(counter_file, len(posts))
 
-for idx, (title, link) in enumerate(posts, 1):
-    print(f"[{idx}/{len(posts)}] 处理: {title}")
-    print(f"  链接: {link}")
+for idx, (title, link) in enumerate(posts[start_idx - 1:], start_idx):
+    write_resume_index(counter_file, idx)
+    hit = False
 
     # 只处理以 mp:// 开头的链接
     if not isinstance(link, str) or not link.startswith(LINK_PREFIX):
-        print("  ⚠ 非 mp 链接，已跳过")
+        print(f"[{idx}/{len(posts)}] 未命中")
         continue
 
     try:
@@ -284,14 +289,12 @@ for idx, (title, link) in enumerate(posts, 1):
         time.sleep(WAIT_AFTER_SEND)  # 等待消息发送完成
 
         # ====== 关键步骤：点击刚发送的链接 ======
-        print(f"  查找并点击链接...")
         clicked = find_and_click_link(wechat_window, link)
 
         if not clicked:
             # 备用方案：点击右侧聊天区域最下方的消息位置，避免点到左侧会话列表
             msg_x = rect.left + int((rect.right - rect.left) * 0.75)
             msg_y = rect.bottom - 180
-            print(f"  未找到链接控件，尝试点击消息区域 ({msg_x}, {msg_y})")
             auto.Click(msg_x, msg_y)
 
         time.sleep(WAIT_APP_POPUP)  # 等待小程序窗口弹出
@@ -303,10 +306,9 @@ for idx, (title, link) in enumerate(posts, 1):
             interval=APP_WINDOW_FIND_INTERVAL,
         )
         if not app_window:
-            print("  ⚠ 未找到校园集市APP窗口，跳过")
+            print(f"[{idx}/{len(posts)}] 未命中")
             continue
 
-        print("  ✓ 已定位到校园集市APP窗口，开始抓取")
         app_window.SetFocus()
         time.sleep(WAIT_AFTER_APP_FOCUS)
 
@@ -321,9 +323,7 @@ for idx, (title, link) in enumerate(posts, 1):
 
         keyword = SAVE_KEYWORD
         content_text = "\n".join(filtered)
-        if keyword not in content_text:
-            print(f"  ⊘ 未命中关键词“{keyword}”，不保存")
-        else:
+        if keyword in content_text:
             filename = f"帖子_{idx:02d}_{safe_filename(title)}.txt"
             filepath = os.path.join(result_dir, filename)
             with open(filepath, 'w', encoding='utf-8') as f:
@@ -334,7 +334,7 @@ for idx, (title, link) in enumerate(posts, 1):
                 for i, t in enumerate(filtered, 1):
                     f.write(f"{i}. {t}\n")
 
-            print(f"  ✓ 命中关键词并已保存: {filepath} ({len(filtered)} 条)")
+            hit = True
             success_count += 1
 
         # 返回聊天界面（关闭小程序）
@@ -345,9 +345,8 @@ for idx, (title, link) in enumerate(posts, 1):
         wechat_window.SetFocus()
         time.sleep(0.12)
 
-    except Exception as e:
-        print(f"  ✗ 错误: {e}")
+    except Exception:
         time.sleep(0.2)
 
-print(f"\n完成! 成功保存 {success_count}/{len(posts)} 个帖子")
+    print(f"[{idx}/{len(posts)}] {'命中' if hit else '未命中'}")
 
